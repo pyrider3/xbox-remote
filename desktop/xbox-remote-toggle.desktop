@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Xbox 遥控器开关
+Name[en]=Xbox Remote Switch
+Comment=一键开启/暂停 Xbox 手柄电脑遥控功能
+Exec=sh -c '"$HOME/.local/bin/xbox-remote" toggle'
+Icon=input-gaming
+Terminal=false
+Type=Application
+Categories=Utility;Settings;
+Keywords=xbox;remote;gamepad;controller;yaokong;

@@ -1,0 +1,13 @@
+[Unit]
+Description=Xbox Controller PC Remote Control
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/xbox-remote
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+"""
+Ultimate Xbox Controller PC Remote for Arch Linux + niri + noctalia.
+Fully populated 3-layer architecture:
+- Layer 0 (Default - Daily Mouse & Media):
+  * LS: Smooth Mouse Cursor
+  * D-pad: Up / Down / Left / Right Arrow Keys
+  * RT: Left Click (BTN_LEFT)
+  * LT: Right Click (BTN_RIGHT)
+  * A: Space (Pause / Page Down)
+  * B: Esc (Cancel / Close Modal)
+  * X: Backspace (Delete text)
+  * Y: Tab (Switch form focus)
+  * RB: Quick tap alone to Close Tab (Ctrl+W) [Disabled when LB is held or recently pressed]
+  * L3: Middle Click (BTN_MIDDLE - Open link in background tab)
+  * R3: Refresh Page (Ctrl+R)
+  * Menu (Start): Noctalia Launcher
+  * View (Select): Qingyin Voice Typing
+  * Xbox Guide: Niri Window Overview
+  * RS Left / Right: Focus Column Left / Right (Schmitt-trigger drift-proof)
+  * RS Up / Down: Focus Workspace Up / Down (Schmitt-trigger drift-proof)
+
+- Layer 1 (Hold LB - Niri Window Flow & Media Control):
+  * LS: 360° Smooth Scroll Wheel
+  * D-pad Up / Down: Focus Workspace Up / Down
+  * D-pad Left / Right: Focus First / Last Column
+  * RT: Noctalia Control Center
+  * LT: Mute / Unmute Toggle (wpctl)
+  * A: Enter confirmation
+  * B: Close Focused Window
+  * X: Cycle Preset Column Width
+  * Y: Fullscreen Window
+  * L3: Show Niri Hotkey Overlay
+  * R3: Play / Pause Media (playerctl)
+  * RS Left / Right: Previous / Next Track
+  * RS Up / Down: Volume Up / Down (5%)
+  * Menu: Open Kitty Terminal
+  * View: Screenshot Region
+  * Xbox Guide: Niri Window Overview
+
+- Layer 2 (Hold LB + RB - Advanced Tiling & Clipboard Toolkit):
+  * D-pad Left / Right: Move Column Left / Right
+  * D-pad Up / Down: Move Column to Workspace Up / Down
+  * Y: Toggle Window Floating
+  * A: Cut (Ctrl+X)
+  * B: Undo (Ctrl+Z)
+  * X: Select All (Ctrl+A)
+  * LT: Consume Window into Column
+  * RT: Expel Window from Column
+  * L3: Center Focused Column
+  * R3: Lock Screen (Noctalia Session Lock)
+  * RS Left: Browser Back (Alt+Left)
+  * RS Right: Browser Forward (Alt+Right)
+  * Menu: Copy (Ctrl+C)
+  * View: Paste (Ctrl+V)
+  * Xbox Guide: Niri Window Overview
+"""
+
+import os
+import sys
+import time
+import glob
+import array
+import fcntl
+import struct
+import select
+import signal
+import subprocess
+
+# --- Linux Input Event Constants ---
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_REL = 0x02
+EV_ABS = 0x03
+
+SYN_REPORT = 0x00
+
+REL_X = 0x00
+REL_Y = 0x01
+REL_HWHEEL = 0x06
+REL_WHEEL = 0x08
+
+ABS_X = 0x00      # Left Stick X
+ABS_Y = 0x01      # Left Stick Y
+ABS_Z = 0x02      # Left Trigger (LT)
+ABS_RX = 0x03     # Right Stick X
+ABS_RY = 0x04     # Right Stick Y
+ABS_RZ = 0x05     # Right Trigger (RT)
+ABS_HAT0X = 0x10  # D-pad X (-1 left, 1 right)
+ABS_HAT0Y = 0x11  # D-pad Y (-1 up, 1 down)
+
+BTN_SOUTH = 0x130   # A
+BTN_EAST = 0x131    # B
+BTN_NORTH = 0x133   # X
+BTN_WEST = 0x134    # Y
+BTN_TL = 0x136      # LB
+BTN_TR = 0x137      # RB
+BTN_SELECT = 0x13A  # View / Back
+BTN_START = 0x13B   # Menu / Start
+BTN_MODE = 0x13C    # Xbox Guide button
+BTN_THUMBL = 0x13D  # LS Click (L3)
+BTN_THUMBR = 0x13E  # RS Click (R3)
+
+BTN_LEFT = 0x110
+BTN_RIGHT = 0x111
+BTN_MIDDLE = 0x112
+
+# Standard Linux Keyboard Keycodes
+KEY_ESC = 1
+KEY_TAB = 15
+KEY_ENTER = 28
+KEY_LEFTCTRL = 29
+KEY_SPACE = 57
+KEY_BACKSPACE = 14
+KEY_LEFTALT = 56
+KEY_W = 17
+KEY_R = 19
+KEY_A = 30
+KEY_Z = 44
+KEY_X = 45
+KEY_C = 46
+KEY_V = 47
+KEY_UP = 103
+KEY_LEFT = 105
+KEY_RIGHT = 106
+KEY_DOWN = 108
+
+# Uinput Ioctls
+UI_SET_EVBIT = 0x40045564
+UI_SET_KEYBIT = 0x40045565
+UI_SET_RELBIT = 0x40045566
+UI_DEV_SETUP = 0x405C5503
+UI_DEV_CREATE = 0x5501
+UI_DEV_DESTROY = 0x5502
+EVIOCGNAME_256 = 0x81004506
+
+PID_FILE = f"/run/user/{os.getuid()}/xbox-remote.pid"
+STATE_FILE = f"/run/user/{os.getuid()}/xbox-remote.state"
+
+
+def get_desktop_env():
+    """Dynamically detects and returns environment variables needed for niri, wayland, and noctalia."""
+    env = os.environ.copy()
+    uid = os.getuid()
+    rundir = f"/run/user/{uid}"
+
+    # Ensure PATH contains local binaries
+    local_bin = os.path.expanduser("~/.local/bin")
+    path_dirs = env.get("PATH", "").split(":")
+    if local_bin not in path_dirs:
+        env["PATH"] = f"{local_bin}:/usr/local/bin:/usr/bin:{env.get('PATH', '')}"
+
+    if "XDG_RUNTIME_DIR" not in env:
+        env["XDG_RUNTIME_DIR"] = rundir
+
+    # Resolve WAYLAND_DISPLAY
+    cur_wayland = env.get("WAYLAND_DISPLAY")
+    if not cur_wayland or not os.path.exists(os.path.join(rundir, cur_wayland)):
+        wayland_sockets = [s for s in glob.glob(f"{rundir}/wayland-[0-9]*") if not s.endswith(".lock")]
+        if wayland_sockets:
+            wayland_sockets.sort(key=lambda s: os.path.getmtime(s), reverse=True)
+            env["WAYLAND_DISPLAY"] = os.path.basename(wayland_sockets[0])
+
+    # Resolve NIRI_SOCKET
+    cur_niri = env.get("NIRI_SOCKET")
+    if not cur_niri or not os.path.exists(cur_niri):
+        niri_sockets = glob.glob(f"{rundir}/niri*.sock")
+        if niri_sockets:
+            niri_sockets.sort(key=lambda s: os.path.getmtime(s), reverse=True)
+            env["NIRI_SOCKET"] = niri_sockets[0]
+
+    return env
+
+
+def notify(summary, body="", timeout_ms=2500):
+    """Sends desktop notification via notify-send."""
+    try:
+        subprocess.Popen(
+            ["notify-send", "-a", "Xbox Remote", "-i", "input-gaming", "-t", str(timeout_ms), summary, body],
+            env=get_desktop_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+
+def run_cmd(args):
+    """Executes a command asynchronously with desktop environment."""
+    try:
+        subprocess.Popen(
+            args,
+            env=get_desktop_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print(f"[XboxRemote] Error executing {args}: {e}", flush=True)
+
+
+def get_daemon_pid():
+    """Returns the PID of running daemon, or None if not running."""
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return pid
+        except (ValueError, OSError):
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
+    return None
+
+
+class VirtualDevice:
+    """Manages virtual mouse and keyboard through Linux /dev/uinput."""
+    def __init__(self):
+        self.fd = os.open('/dev/uinput', os.O_WRONLY | os.O_NONBLOCK)
+        self._setup()
+
+    def _setup(self):
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_REL)
+        for rel in (REL_X, REL_Y, REL_WHEEL, REL_HWHEEL):
+            fcntl.ioctl(self.fd, UI_SET_RELBIT, rel)
+
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        keys_to_enable = [
+            BTN_LEFT, BTN_RIGHT, BTN_MIDDLE,
+            KEY_ESC, KEY_TAB, KEY_ENTER, KEY_SPACE, KEY_BACKSPACE,
+            KEY_LEFTCTRL, KEY_LEFTALT,
+            KEY_W, KEY_R, KEY_A, KEY_Z, KEY_X, KEY_C, KEY_V,
+            KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT
+        ]
+        for k in keys_to_enable:
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, k)
+
+        name = b'Xbox Ultimate Remote\x00' + b'\x00' * (80 - len('Xbox Ultimate Remote\x00'))
+        uinput_setup = struct.pack('HHHH80sI', 0x03, 0x045E, 0x0B13, 0x01, name, 0)
+        fcntl.ioctl(self.fd, UI_DEV_SETUP, uinput_setup)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+    def emit(self, ev_type, code, value):
+        event = struct.pack('qqHHi', 0, 0, ev_type, code, value)
+        os.write(self.fd, event)
+
+    def syn(self):
+        self.emit(EV_SYN, SYN_REPORT, 0)
+
+    def key_down(self, key):
+        self.emit(EV_KEY, key, 1)
+        self.syn()
+
+    def key_up(self, key):
+        self.emit(EV_KEY, key, 0)
+        self.syn()
+
+    def key_click(self, key):
+        self.emit(EV_KEY, key, 1)
+        self.syn()
+        time.sleep(0.005)
+        self.emit(EV_KEY, key, 0)
+        self.syn()
+
+    def key_combo(self, *keys):
+        for k in keys:
+            self.emit(EV_KEY, k, 1)
+        self.syn()
+        time.sleep(0.008)
+        for k in reversed(keys):
+            self.emit(EV_KEY, k, 0)
+        self.syn()
+
+    def move_rel(self, dx, dy):
+        if dx != 0 or dy != 0:
+            if dx != 0:
+                self.emit(EV_REL, REL_X, int(dx))
+            if dy != 0:
+                self.emit(EV_REL, REL_Y, int(dy))
+            self.syn()
+
+    def scroll_v(self, amount):
+        if amount != 0:
+            self.emit(EV_REL, REL_WHEEL, int(amount))
+            self.syn()
+
+    def scroll_h(self, amount):
+        if amount != 0:
+            self.emit(EV_REL, REL_HWHEEL, int(amount))
+            self.syn()
+
+    def destroy(self):
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+            os.close(self.fd)
+        except Exception:
+            pass
+
+
+class ControllerReader:
+    """Finds, reads, and normalizes Xbox Controller events."""
+    def __init__(self):
+        self.dev_fd = -1
+        self.dev_path = None
+        self.dev_name = ""
+        self.abs_info = {}
+
+    def find_device(self):
+        for ev in sorted(glob.glob('/dev/input/event*')):
+            try:
+                fd = os.open(ev, os.O_RDONLY | os.O_NONBLOCK)
+                buf = array.array('B', [0] * 256)
+                fcntl.ioctl(fd, EVIOCGNAME_256, buf)
+                name = bytes(buf).decode('utf-8', errors='ignore').rstrip('\x00')
+                name_lower = name.lower()
+                if any(k in name_lower for k in ("xbox", "wireless controller", "gamepad", "x-box")):
+                    os.close(fd)
+                    return ev, name
+                os.close(fd)
+            except Exception:
+                continue
+        return None, None
+
+    def open_device(self, path, name):
+        self.dev_path = path
+        self.dev_name = name
+        self.dev_fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        self._load_absinfo()
+        print(f"[XboxRemote] Connected to: {name} ({path})")
+        notify("Xbox 手柄已就绪", "全功能三层定制方案已激活\n基础层：网页影音 | LB：桌面中枢 | LB+RB：文本排版")
+
+    def _load_absinfo(self):
+        self.abs_info.clear()
+        for axis in (ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ):
+            try:
+                buf = array.array('i', [0] * 6)
+                fcntl.ioctl(self.dev_fd, 0x80184540 + axis, buf)
+                _, minimum, maximum, _, flat, _ = buf
+                center = (minimum + maximum) / 2.0
+                half_range = (maximum - minimum) / 2.0
+                if half_range > 0:
+                    self.abs_info[axis] = (center, half_range)
+            except Exception:
+                self.abs_info[axis] = (0.0, 32767.0)
+
+    def normalize_axis(self, axis, raw_val):
+        center, half_range = self.abs_info.get(axis, (0.0, 32767.0))
+        val = (raw_val - center) / half_range
+        return max(-1.0, min(1.0, val))
+
+    def close(self):
+        if self.dev_fd >= 0:
+            try:
+                os.close(self.dev_fd)
+            except Exception:
+                pass
+            self.dev_fd = -1
+            self.dev_path = None
+            print("[XboxRemote] Controller disconnected.")
+            notify("Xbox 手柄已断开", "等待手柄唤醒重连...")
+
+
+class XboxRemoteDaemon:
+    def __init__(self):
+        self.running = True
+        self.mode_enabled = True
+
+        self.uinput = VirtualDevice()
+        self.reader = ControllerReader()
+
+        # Modifier states & anti-misfire interlock for LB/RB
+        self.lb_down = False
+        self.rb_down = False
+        self.rb_press_time = 0.0
+        self.last_lb_time = 0.0
+        self.last_lb_release_time = 0.0
+        self.rb_suppress_tab = False
+
+        # Raw analog inputs
+        self.lx = 0.0
+        self.ly = 0.0
+        self.rx = 0.0
+        self.ry = 0.0
+        self.lt = 0.0
+        self.rt = 0.0
+
+        # Sub-pixel accumulators
+        self.acc_dx = 0.0
+        self.acc_dy = 0.0
+        self.acc_scroll_v = 0.0
+        self.acc_scroll_h = 0.0
+
+        # Button & Trigger edge-trigger states
+        self.rt_pressed = False
+        self.lt_pressed = False
+        self.active_dpad_arrow = None
+
+        # Schmitt-trigger state for Right Stick to guarantee drift immunity
+        self.rs_flick_x_state = 0   # -1 (left), 0 (center), 1 (right)
+        self.rs_flick_y_state = 0   # -1 (up), 0 (center), 1 (down)
+        self.rs_volume_timer = 0.0
+
+        # Sensitivities
+        self.deadzone_stick = 0.15
+        self.deadzone_scroll = 0.16
+        self.mouse_max_speed = 24.0
+        self.scroll_speed = 3.8
+
+        self._write_state()
+
+    def _write_state(self):
+        try:
+            with open(STATE_FILE, "w") as f:
+                f.write("active\n" if self.mode_enabled else "paused\n")
+        except OSError:
+            pass
+
+    def stop(self, *args):
+        self.running = False
+
+    def toggle_mode(self):
+        self.mode_enabled = not self.mode_enabled
+        self._write_state()
+        if self.mode_enabled:
+            print("[XboxRemote] Mode: ACTIVE")
+            notify("🎮 Xbox 遥控器", "🟢 遥控模式：【已开启】", timeout_ms=2000)
+        else:
+            print("[XboxRemote] Mode: PAUSED")
+            self._release_all()
+            notify("🎮 Xbox 遥控器", "🔴 遥控模式：【已暂停】", timeout_ms=2000)
+
+    def _release_all(self):
+        self.uinput.key_up(BTN_LEFT)
+        self.uinput.key_up(BTN_RIGHT)
+        self.uinput.key_up(BTN_MIDDLE)
+        if self.active_dpad_arrow is not None:
+            self.uinput.key_up(self.active_dpad_arrow)
+            self.active_dpad_arrow = None
+        self.acc_dx = self.acc_dy = 0.0
+        self.acc_scroll_v = self.acc_scroll_h = 0.0
+        self.rt_pressed = False
+        self.lt_pressed = False
+        self.rs_flick_x_state = 0
+        self.rs_flick_y_state = 0
+
+    def get_layer(self):
+        """Returns 0 (default), 1 (LB held), or 2 (LB + RB held)."""
+        if self.lb_down and self.rb_down:
+            return 2
+        elif self.lb_down:
+            return 1
+        return 0
+
+    def process_event(self, ev_type, code, value):
+        if ev_type == EV_KEY:
+            now = time.time()
+
+            # LB Modifier
+            if code == BTN_TL:
+                old_layer = self.get_layer()
+                self.lb_down = (value == 1)
+                if self.lb_down:
+                    self.last_lb_time = now
+                    # Interlock: once LB is pressed, immediately suppress any tab close from RB
+                    self.rb_suppress_tab = True
+                else:
+                    self.last_lb_release_time = now
+
+                new_layer = self.get_layer()
+                if old_layer != new_layer:
+                    self._release_all()
+                return
+
+            # RB Modifier
+            elif code == BTN_TR:
+                old_layer = self.get_layer()
+                self.rb_down = (value == 1)
+
+                if value == 1:
+                    self.rb_press_time = now
+                    # Check interlock: if LB is held, or was touched within 0.5s, suppress tab close
+                    if self.lb_down or (now - self.last_lb_time < 0.5) or (now - self.last_lb_release_time < 0.5):
+                        self.rb_suppress_tab = True
+                    else:
+                        self.rb_suppress_tab = False
+                else:
+                    # RB released (Key-Up)
+                    tap_duration = now - self.rb_press_time
+                    # Only close tab if RB was tapped quickly without LB being pressed or recently touched
+                    if (not self.rb_suppress_tab and
+                        not self.lb_down and
+                        (now - self.last_lb_time > 0.5) and
+                        (now - self.last_lb_release_time > 0.5) and
+                        tap_duration < 0.35 and
+                        self.mode_enabled):
+                        print("[XboxRemote] Action: Close Tab (Ctrl+W)", flush=True)
+                        self.uinput.key_combo(KEY_LEFTCTRL, KEY_W)
+                    self.rb_suppress_tab = False
+
+                new_layer = self.get_layer()
+                if old_layer != new_layer:
+                    self._release_all()
+                return
+
+            if not self.mode_enabled:
+                return
+
+            layer = self.get_layer()
+
+            # ==========================================================
+            # LAYER 2: HOLD LB + RB
+            # ==========================================================
+            if layer == 2:
+                if value == 1:
+                    # Y -> Toggle Window Floating
+                    if code == BTN_WEST:
+                        run_cmd(["niri", "msg", "action", "toggle-window-floating"])
+
+                    # A -> Cut (Ctrl+X)
+                    elif code == BTN_SOUTH:
+                        self.uinput.key_combo(KEY_LEFTCTRL, KEY_X)
+
+                    # B -> Undo (Ctrl+Z)
+                    elif code == BTN_EAST:
+                        self.uinput.key_combo(KEY_LEFTCTRL, KEY_Z)
+
+                    # X -> Select All (Ctrl+A)
+                    elif code == BTN_NORTH:
+                        self.uinput.key_combo(KEY_LEFTCTRL, KEY_A)
+
+                    # R3 -> Lock Screen
+                    elif code == BTN_THUMBR:
+                        run_cmd(["noctalia", "msg", "session", "lock"])
+
+                    # L3 -> Center Column
+                    elif code == BTN_THUMBL:
+                        run_cmd(["niri", "msg", "action", "center-column"])
+
+                    # Menu -> Copy (Ctrl+C)
+                    elif code == BTN_START:
+                        self.uinput.key_combo(KEY_LEFTCTRL, KEY_C)
+
+                    # View -> Paste (Ctrl+V)
+                    elif code == BTN_SELECT:
+                        self.uinput.key_combo(KEY_LEFTCTRL, KEY_V)
+
+                    # Xbox Guide -> Overview
+                    elif code == BTN_MODE:
+                        run_cmd(["niri", "msg", "action", "toggle-overview"])
+                return
+
+            # ==========================================================
+            # LAYER 1: HOLD LB (RB not held)
+            # ==========================================================
+            if layer == 1:
+                if value == 1:
+                    # A -> Enter confirmation
+                    if code == BTN_SOUTH:
+                        self.uinput.key_click(KEY_ENTER)
+
+                    # B -> Close Window
+                    elif code == BTN_EAST:
+                        run_cmd(["niri", "msg", "action", "close-window"])
+
+                    # X -> Cycle Preset Column Width
+                    elif code == BTN_NORTH:
+                        run_cmd(["niri", "msg", "action", "switch-preset-column-width"])
+
+                    # Y -> Fullscreen Window
+                    elif code == BTN_WEST:
+                        run_cmd(["niri", "msg", "action", "fullscreen-window"])
+
+                    # R3 -> Play / Pause (playerctl)
+                    elif code == BTN_THUMBR:
+                        run_cmd(["playerctl", "play-pause"])
+
+                    # L3 -> Show Niri Hotkey Overlay
+                    elif code == BTN_THUMBL:
+                        run_cmd(["niri", "msg", "action", "show-hotkey-overlay"])
+
+                    # View -> Screenshot Region
+                    elif code == BTN_SELECT:
+                        run_cmd(["noctalia", "msg", "screenshot-region"])
+
+                    # Menu -> Open Kitty Terminal
+                    elif code == BTN_START:
+                        run_cmd(["kitty"])
+
+                    # Xbox Guide -> Overview
+                    elif code == BTN_MODE:
+                        run_cmd(["niri", "msg", "action", "toggle-overview"])
+                return
+
+            # ==========================================================
+            # LAYER 0: DEFAULT (Neither LB nor RB held)
+            # ==========================================================
+            if layer == 0:
+                if value == 1:
+                    # A -> Space
+                    if code == BTN_SOUTH:
+                        self.uinput.key_click(KEY_SPACE)
+
+                    # B -> Esc
+                    elif code == BTN_EAST:
+                        self.uinput.key_click(KEY_ESC)
+
+                    # X -> Backspace
+                    elif code == BTN_NORTH:
+                        self.uinput.key_click(KEY_BACKSPACE)
+
+                    # Y -> Tab
+                    elif code == BTN_WEST:
+                        self.uinput.key_click(KEY_TAB)
+
+                    # Menu -> Noctalia Launcher
+                    elif code == BTN_START:
+                        print("[XboxRemote] Action: Open Noctalia Launcher", flush=True)
+                        run_cmd(["noctalia", "msg", "panel-toggle", "launcher"])
+
+                    # View -> Qingyin Voice Typing
+                    elif code == BTN_SELECT:
+                        run_cmd(["qingyin", "toggle"])
+
+                    # L3 -> Middle Click (BTN_MIDDLE)
+                    elif code == BTN_THUMBL:
+                        self.uinput.key_down(BTN_MIDDLE)
+
+                    # R3 -> Refresh Page (Ctrl+R)
+                    elif code == BTN_THUMBR:
+                        self.uinput.key_combo(KEY_LEFTCTRL, KEY_R)
+
+                    # Xbox Guide -> Niri Overview
+                    elif code == BTN_MODE:
+                        run_cmd(["niri", "msg", "action", "toggle-overview"])
+
+                elif value == 0:
+                    if code == BTN_THUMBL:
+                        self.uinput.key_up(BTN_MIDDLE)
+
+        elif ev_type == EV_ABS:
+            if code == ABS_X:
+                self.lx = self.reader.normalize_axis(code, value)
+            elif code == ABS_Y:
+                self.ly = self.reader.normalize_axis(code, value)
+            elif code == ABS_RX:
+                self.rx = self.reader.normalize_axis(code, value)
+                self.handle_rs_flick_x()
+            elif code == ABS_RY:
+                self.ry = self.reader.normalize_axis(code, value)
+                self.handle_rs_flick_y()
+
+            if not self.mode_enabled:
+                return
+
+            layer = self.get_layer()
+
+            # ---------------- LT Trigger ----------------
+            if code == ABS_Z:
+                norm = self.reader.normalize_axis(code, value)
+                self.lt = max(0.0, norm)
+                if layer == 0:
+                    # Layer 0: LT -> Right Click (hold to drag/context)
+                    if self.lt > 0.40 and not self.lt_pressed:
+                        self.lt_pressed = True
+                        self.uinput.key_down(BTN_RIGHT)
+                    elif self.lt <= 0.25 and self.lt_pressed:
+                        self.lt_pressed = False
+                        self.uinput.key_up(BTN_RIGHT)
+
+                elif layer == 1:
+                    # Layer 1: LT -> Mute / Unmute Toggle (edge-triggered)
+                    if self.lt > 0.50 and not self.lt_pressed:
+                        self.lt_pressed = True
+                        run_cmd(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+                    elif self.lt <= 0.25 and self.lt_pressed:
+                        self.lt_pressed = False
+
+                elif layer == 2:
+                    # Layer 2: LT -> Consume Window into Column
+                    if self.lt > 0.50 and not self.lt_pressed:
+                        self.lt_pressed = True
+                        run_cmd(["niri", "msg", "action", "consume-window-into-column"])
+                    elif self.lt <= 0.25 and self.lt_pressed:
+                        self.lt_pressed = False
+
+            # ---------------- RT Trigger ----------------
+            elif code == ABS_RZ:
+                norm = self.reader.normalize_axis(code, value)
+                self.rt = max(0.0, norm)
+                if layer == 0:
+                    # Layer 0: RT -> Left Click (hold to drag)
+                    if self.rt > 0.40 and not self.rt_pressed:
+                        self.rt_pressed = True
+                        self.uinput.key_down(BTN_LEFT)
+                    elif self.rt <= 0.25 and self.rt_pressed:
+                        self.rt_pressed = False
+                        self.uinput.key_up(BTN_LEFT)
+
+                elif layer == 1:
+                    # Layer 1: RT -> Noctalia Control Center
+                    if self.rt > 0.50 and not self.rt_pressed:
+                        self.rt_pressed = True
+                        run_cmd(["noctalia", "msg", "panel-toggle", "control-center"])
+                    elif self.rt <= 0.25 and self.rt_pressed:
+                        self.rt_pressed = False
+
+                elif layer == 2:
+                    # Layer 2: RT -> Expel Window from Column
+                    if self.rt > 0.50 and not self.rt_pressed:
+                        self.rt_pressed = True
+                        run_cmd(["niri", "msg", "action", "expel-window-from-column"])
+                    elif self.rt <= 0.25 and self.rt_pressed:
+                        self.rt_pressed = False
+
+            # ---------------- D-Pad Vertical (HAT0Y) ----------------
+            elif code == ABS_HAT0Y:
+                if layer == 0:
+                    # Layer 0: Keyboard Arrow Up / Down
+                    if value == -1:
+                        self._set_arrow_key(KEY_UP)
+                    elif value == 1:
+                        self._set_arrow_key(KEY_DOWN)
+                    else:
+                        self._clear_arrow_key_if_vertical()
+
+                elif layer == 1:
+                    # Layer 1: Focus Workspace Up / Down
+                    if value == -1:
+                        run_cmd(["niri", "msg", "action", "focus-workspace-up"])
+                    elif value == 1:
+                        run_cmd(["niri", "msg", "action", "focus-workspace-down"])
+
+                elif layer == 2:
+                    # Layer 2: Move Column to Workspace Up / Down
+                    if value == -1:
+                        run_cmd(["niri", "msg", "action", "move-column-to-workspace-up"])
+                    elif value == 1:
+                        run_cmd(["niri", "msg", "action", "move-column-to-workspace-down"])
+
+            # ---------------- D-Pad Horizontal (HAT0X) ----------------
+            elif code == ABS_HAT0X:
+                if layer == 0:
+                    # Layer 0: Keyboard Arrow Left / Right
+                    if value == -1:
+                        self._set_arrow_key(KEY_LEFT)
+                    elif value == 1:
+                        self._set_arrow_key(KEY_RIGHT)
+                    else:
+                        self._clear_arrow_key_if_horizontal()
+
+                elif layer == 1:
+                    # Layer 1: Focus First / Last Column
+                    if value == -1:
+                        run_cmd(["niri", "msg", "action", "focus-column-first"])
+                    elif value == 1:
+                        run_cmd(["niri", "msg", "action", "focus-column-last"])
+
+                elif layer == 2:
+                    # Layer 2: Move Column Left / Right
+                    if value == -1:
+                        run_cmd(["niri", "msg", "action", "move-column-left"])
+                    elif value == 1:
+                        run_cmd(["niri", "msg", "action", "move-column-right"])
+
+    def _set_arrow_key(self, key):
+        if self.active_dpad_arrow is not None and self.active_dpad_arrow != key:
+            self.uinput.key_up(self.active_dpad_arrow)
+        self.active_dpad_arrow = key
+        self.uinput.key_down(key)
+
+    def _clear_arrow_key_if_vertical(self):
+        if self.active_dpad_arrow in (KEY_UP, KEY_DOWN):
+            self.uinput.key_up(self.active_dpad_arrow)
+            self.active_dpad_arrow = None
+
+    def _clear_arrow_key_if_horizontal(self):
+        if self.active_dpad_arrow in (KEY_LEFT, KEY_RIGHT):
+            self.uinput.key_up(self.active_dpad_arrow)
+            self.active_dpad_arrow = None
+
+    def handle_rs_flick_x(self):
+        """Schmitt-trigger edge-detection for RS Left / Right (drift-proof)."""
+        if not self.mode_enabled:
+            return
+
+        FLICK_THRESH = 0.50
+        RESET_THRESH = 0.25
+        rx = self.rx
+        layer = self.get_layer()
+
+        if self.rs_flick_x_state == 0:
+            if rx > FLICK_THRESH:
+                self.rs_flick_x_state = 1
+                if layer == 0:
+                    print("[XboxRemote] Action: Focus Column Right", flush=True)
+                    run_cmd(["niri", "msg", "action", "focus-column-right"])
+                elif layer == 1:
+                    run_cmd(["playerctl", "next"])
+                elif layer == 2:
+                    self.uinput.key_combo(KEY_LEFTALT, KEY_RIGHT)
+
+            elif rx < -FLICK_THRESH:
+                self.rs_flick_x_state = -1
+                if layer == 0:
+                    print("[XboxRemote] Action: Focus Column Left", flush=True)
+                    run_cmd(["niri", "msg", "action", "focus-column-left"])
+                elif layer == 1:
+                    run_cmd(["playerctl", "previous"])
+                elif layer == 2:
+                    self.uinput.key_combo(KEY_LEFTALT, KEY_LEFT)
+
+        elif self.rs_flick_x_state == 1:
+            if rx < RESET_THRESH:
+                self.rs_flick_x_state = 0
+
+        elif self.rs_flick_x_state == -1:
+            if rx > -RESET_THRESH:
+                self.rs_flick_x_state = 0
+
+    def handle_rs_flick_y(self):
+        """Schmitt-trigger detection for RS Up / Down (Workspaces in Layer 0, Volume in Layer 1)."""
+        if not self.mode_enabled:
+            return
+
+        FLICK_THRESH = 0.50
+        RESET_THRESH = 0.25
+        ry = self.ry
+        layer = self.get_layer()
+
+        if layer == 0:
+            # Layer 0: RS Up / Down -> Focus Workspace Up / Down
+            if self.rs_flick_y_state == 0:
+                if ry < -FLICK_THRESH:
+                    self.rs_flick_y_state = -1
+                    print("[XboxRemote] Action: Focus Workspace Up", flush=True)
+                    run_cmd(["niri", "msg", "action", "focus-workspace-up"])
+                elif ry > FLICK_THRESH:
+                    self.rs_flick_y_state = 1
+                    print("[XboxRemote] Action: Focus Workspace Down", flush=True)
+                    run_cmd(["niri", "msg", "action", "focus-workspace-down"])
+
+            elif self.rs_flick_y_state == -1:
+                if ry > -RESET_THRESH:
+                    self.rs_flick_y_state = 0
+
+            elif self.rs_flick_y_state == 1:
+                if ry < RESET_THRESH:
+                    self.rs_flick_y_state = 0
+
+        elif layer == 1:
+            # Layer 1: Volume Up / Down (5%)
+            now = time.time()
+            if ry < -FLICK_THRESH:
+                if self.rs_flick_y_state != -1 or (now - self.rs_volume_timer > 0.18):
+                    self.rs_flick_y_state = -1
+                    self.rs_volume_timer = now
+                    run_cmd(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "0.05+", "-l", "1.0"])
+            elif ry > FLICK_THRESH:
+                if self.rs_flick_y_state != 1 or (now - self.rs_volume_timer > 0.18):
+                    self.rs_flick_y_state = 1
+                    self.rs_volume_timer = now
+                    run_cmd(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "0.05-"])
+            elif abs(ry) < RESET_THRESH:
+                self.rs_flick_y_state = 0
+
+        else:
+            if abs(ry) < RESET_THRESH:
+                self.rs_flick_y_state = 0
+
+    def update_motion(self, dt):
+        """Continuous motions for Left Stick."""
+        if not self.mode_enabled:
+            return
+
+        layer = self.get_layer()
+        lx = self.lx
+        ly = self.ly
+
+        # ==========================================================
+        # LAYER 1: Left Stick -> 360° Smooth Scroll Wheel
+        # ==========================================================
+        if layer == 1:
+            self.acc_dx = self.acc_dy = 0.0
+
+            if abs(ly) > self.deadzone_scroll:
+                norm_y = (abs(ly) - self.deadzone_scroll) / (1.0 - self.deadzone_scroll)
+                scroll_delta = -1.0 if ly > 0 else 1.0
+                scroll_amount = scroll_delta * (norm_y ** 1.5) * self.scroll_speed
+                self.acc_scroll_v += scroll_amount
+                step_scroll = int(self.acc_scroll_v)
+                if step_scroll != 0:
+                    self.uinput.scroll_v(step_scroll)
+                    self.acc_scroll_v -= step_scroll
+            else:
+                self.acc_scroll_v = 0.0
+
+            if abs(lx) > self.deadzone_scroll:
+                norm_x = (abs(lx) - self.deadzone_scroll) / (1.0 - self.deadzone_scroll)
+                hscroll_delta = 1.0 if lx > 0 else -1.0
+                hscroll_amount = hscroll_delta * (norm_x ** 1.5) * (self.scroll_speed * 0.8)
+                self.acc_scroll_h += hscroll_amount
+                step_hscroll = int(self.acc_scroll_h)
+                if step_hscroll != 0:
+                    self.uinput.scroll_h(step_hscroll)
+                    self.acc_scroll_h -= step_hscroll
+            else:
+                self.acc_scroll_h = 0.0
+
+            return
+
+        # ==========================================================
+        # LAYER 0: Left Stick -> Move Mouse Cursor
+        # ==========================================================
+        if layer == 0:
+            self.acc_scroll_v = self.acc_scroll_h = 0.0
+            dist = (lx * lx + ly * ly) ** 0.5
+
+            if dist > self.deadzone_stick:
+                norm_dist = min(1.0, (dist - self.deadzone_stick) / (1.0 - self.deadzone_stick))
+                speed = (norm_dist * 0.35 + (norm_dist ** 2) * 0.65) * self.mouse_max_speed
+                vx = (lx / dist) * speed
+                vy = (ly / dist) * speed
+
+                self.acc_dx += vx
+                self.acc_dy += vy
+
+                step_x = int(self.acc_dx)
+                step_y = int(self.acc_dy)
+
+                if step_x != 0 or step_y != 0:
+                    self.uinput.move_rel(step_x, step_y)
+                    self.acc_dx -= step_x
+                    self.acc_dy -= step_y
+            else:
+                self.acc_dx = 0.0
+                self.acc_dy = 0.0
+            return
+
+        # LAYER 2: LS idle
+        self.acc_dx = self.acc_dy = 0.0
+        self.acc_scroll_v = self.acc_scroll_h = 0.0
+
+    def run(self):
+        try:
+            with open(PID_FILE, "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
+
+        print(f"[XboxRemote] Ultimate Daemon started (PID {os.getpid()}). Looking for Xbox controller...")
+        TICK_INTERVAL = 0.012
+
+        while self.running:
+            if self.reader.dev_fd < 0:
+                path, name = self.reader.find_device()
+                if path:
+                    try:
+                        self.reader.open_device(path, name)
+                    except Exception as e:
+                        print(f"[XboxRemote] Failed to open {path}: {e}")
+                        time.sleep(1.5)
+                        continue
+                else:
+                    time.sleep(1.0)
+                    continue
+
+            t0 = time.time()
+            try:
+                rlist, _, _ = select.select([self.reader.dev_fd], [], [], TICK_INTERVAL)
+
+                if rlist:
+                    data = os.read(self.reader.dev_fd, 24 * 32)
+                    num_events = len(data) // 24
+                    for i in range(num_events):
+                        ev = data[i * 24 : (i + 1) * 24]
+                        _, _, ev_type, code, value = struct.unpack('qqHHi', ev)
+                        self.process_event(ev_type, code, value)
+
+                dt = time.time() - t0
+                self.update_motion(dt)
+
+            except OSError:
+                self.reader.close()
+                self._release_all()
+                self.lb_down = False
+                self.rb_down = False
+                self.lx = self.ly = self.rx = self.ry = 0.0
+                time.sleep(1.0)
+
+        try:
+            if os.path.exists(PID_FILE):
+                os.remove(PID_FILE)
+            if os.path.exists(STATE_FILE):
+                os.remove(STATE_FILE)
+        except OSError:
+            pass
+        self.reader.close()
+        self.uinput.destroy()
+        print("[XboxRemote] Stopped cleanly.")
+
+
+def handle_cli():
+    """Handles CLI arguments for controlling the switch."""
+    if len(sys.argv) < 2:
+        return False
+
+    cmd = sys.argv[1].lower()
+
+    if cmd == "toggle":
+        pid = get_daemon_pid()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGUSR1)
+                return True
+            except OSError:
+                pass
+        subprocess.run(["systemctl", "--user", "start", "xbox-remote"])
+        notify("🎮 Xbox 遥控器", "🟢 遥控服务已启动", timeout_ms=2000)
+        return True
+
+    elif cmd in ("on", "start"):
+        pid = get_daemon_pid()
+        if pid:
+            state = "active"
+            if os.path.exists(STATE_FILE):
+                try:
+                    with open(STATE_FILE, "r") as f:
+                        state = f.read().strip()
+                except OSError:
+                    pass
+            if state != "active":
+                os.kill(pid, signal.SIGUSR1)
+            else:
+                notify("🎮 Xbox 遥控器", "当前已经是开启状态", timeout_ms=1500)
+        else:
+            subprocess.run(["systemctl", "--user", "start", "xbox-remote"])
+            notify("🎮 Xbox 遥控器", "🟢 遥控服务已启动", timeout_ms=2000)
+        return True
+
+    elif cmd in ("off", "stop"):
+        pid = get_daemon_pid()
+        if pid:
+            state = "active"
+            if os.path.exists(STATE_FILE):
+                try:
+                    with open(STATE_FILE, "r") as f:
+                        state = f.read().strip()
+                except OSError:
+                    pass
+            if state == "active":
+                os.kill(pid, signal.SIGUSR1)
+            else:
+                notify("🎮 Xbox 遥控器", "当前已处于暂停状态", timeout_ms=1500)
+        return True
+
+    elif cmd == "status":
+        pid = get_daemon_pid()
+        if pid:
+            state = "active"
+            if os.path.exists(STATE_FILE):
+                try:
+                    with open(STATE_FILE, "r") as f:
+                        state = f.read().strip()
+                except OSError:
+                    pass
+            status_zh = "运行中 (已开启 - 全功能旗舰版)" if state == "active" else "运行中 (已暂停)"
+            print(f"Xbox Remote Daemon is running [PID {pid}]: {status_zh}")
+        else:
+            print("Xbox Remote Daemon is not running.")
+        return True
+
+    elif cmd in ("-h", "--help", "help"):
+        print("Usage: xbox-remote [toggle|on|off|status]")
+        return True
+
+    return False
+
+
+def main():
+    if handle_cli():
+        return
+
+    daemon = XboxRemoteDaemon()
+
+    def handle_sigint(sig, frame):
+        daemon.stop()
+
+    def handle_sigusr1(sig, frame):
+        daemon.toggle_mode()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGTERM, handle_sigint)
+    signal.signal(signal.SIGUSR1, handle_sigusr1)
+
+    daemon.run()
+
+
+if __name__ == "__main__":
+    main()

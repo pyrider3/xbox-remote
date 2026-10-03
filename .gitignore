@@ -1,0 +1,15 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary / OS files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Runtime files
+*.pid
+*.state
+*.log
